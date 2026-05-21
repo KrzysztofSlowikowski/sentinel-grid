@@ -1,0 +1,15 @@
+# Skompilowane pliki
+*.o
+*.exe
+sentinel_test
+bme680_test
+pms5003_test
+mpu6050_test
+
+# Edytory
+*.swp
+.vscode/
+
+# System
+.DS_Store
+Thumbs.db
