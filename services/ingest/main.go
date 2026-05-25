@@ -8,8 +8,10 @@ import ( //importujemy biblioteki/pakiety
     "log" // (logowanie z timestampami)
     "strings" //(operacje ns stringach)
     "time" //(czas)
+    "os"
 
     mqtt "github.com/eclipse/paho.mqtt.golang" //2zewnętrzne pakiety (z githuba)
+    "github.com/joho/godotenv"
     _ "github.com/lib/pq" //3 te takie z podkreślnikiem to takie które importujemy ale nie używamy
 )
 
@@ -150,46 +152,156 @@ func messageHandler(client mqtt.Client, msg mqtt.Message) {
 func main() {
     log.Println("=== Go Ingest Service ===")
 
-    // --- POŁĄCZENIE Z BAZĄ DANYCH ---
-    // String formatowany
-    connStr := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
-        DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME)
-    
-    //Dlaczego var err error? Bo później użyjemy = a nie :=.
-    //:= stworzyłoby NOWĄ zmienną db (lokalną), a nie przypisało do globalnej.
-    var err error
-    db, err = sql.Open("postgres", connStr) //- otwiera połączenie (ale NIE ŁĄCZY! tylko tworzy obiekt).
-    //Łączy się dopiero przy pierwszym zapytaniu.
-    if err != nil {
-        log.Fatal("Błąd otwarcia bazy:", err)
+    // --- WCZYTANIE KONFIGURACJI Z PLIKU .env ---
+    // godotenv.Load() czyta plik .env i ustawia zmienne środowiskowe
+    // Jeśli pliku nie ma, po prostu idzie dalej (użyje domyślnych lub systemowych)
+    if err := godotenv.Load(); err != nil {
+        log.Println("Uwaga: brak pliku .env, używam domyślnych wartości lub zmiennych systemowych")
     }
-    defer db.Close() // Odkłada wykonanie funkcji do momentu wyjścia z main() (nawet przez log.Fatal).
 
+    // --- ODCZYT KONFIGURACJI MQTT ZE ZMIENNYCH ŚRODOWISKOWYCH ---
+    // os.Getenv() czyta zmienną środowiskową (ustawioną przez .env lub system)
+    // Jeśli zmienna nie istnieje, zwraca pusty string
+    mqttBroker := os.Getenv("MQTT_BROKER")
+    if mqttBroker == "" {
+        mqttBroker = "tcp://localhost:1883" // domyślna wartość gdy brak zmiennej
+    }
+    
+    mqttClientID := os.Getenv("MQTT_CLIENT_ID")
+    if mqttClientID == "" {
+        mqttClientID = "go_ingest"
+    }
+
+    // --- ODCZYT KONFIGURACJI BAZY DANYCH ---
+    dbHost := os.Getenv("DB_HOST")
+    if dbHost == "" {
+        dbHost = "localhost"
+    }
+    
+    dbPort := os.Getenv("DB_PORT")
+    if dbPort == "" {
+        dbPort = "5432"
+    }
+    
+    dbUser := os.Getenv("DB_USER")
+    if dbUser == "" {
+        dbUser = "postgres"
+    }
+    
+    dbPassword := os.Getenv("DB_PASSWORD")
+    if dbPassword == "" {
+        dbPassword = "password"
+    }
+    
+    dbName := os.Getenv("DB_NAME")
+    if dbName == "" {
+        dbName = "sentinel"
+    }
+
+    // Logujemy używaną konfigurację (bez hasła dla bezpieczeństwa)
+    log.Printf("Konfiguracja: MQTT broker=%s, DB host=%s port=%s db=%s", 
+        mqttBroker, dbHost, dbPort, dbName)
+
+    // --- POŁĄCZENIE Z BAZĄ DANYCH ---
+    // fmt.Sprintf formatuje string z wartościami (jak printf, ale zwraca string)
+    // sslmode=disable - wyłączamy SSL bo pracujemy lokalnie (na serwerze włączymy)
+    connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+        dbHost, dbPort, dbUser, dbPassword, dbName)
+    
+    // Dlaczego var err error? Bo później użyjemy = a nie :=.
+    // := stworzyłoby NOWĄ zmienną db (lokalną), a nie przypisało do globalnej.
+    var err error
+    
+    // sql.Open() - otwiera połączenie (ale NIE ŁĄCZY! tylko tworzy obiekt).
+    // Łączy się dopiero przy pierwszym zapytaniu.
+    db, err = sql.Open("postgres", connStr)
+    if err != nil {
+        log.Fatal("Błąd otwarcia bazy:", err) // log.Fatal = log + os.Exit(1)
+    }
+    
+    // defer odkłada wykonanie funkcji do momentu wyjścia z main() (nawet przez log.Fatal)
+    // To jak "finally" lub "atexit" - zawsze się wykona na końcu
+    defer db.Close()
+
+    // db.Ping() - faktycznie łączy się z bazą i sprawdza czy odpowiada.
+    // sql.Open() tego nie robi - trzeba sprawdzić osobno.
     err = db.Ping()
     if err != nil {
         log.Fatal("Błąd połączenia z bazą:", err)
     }
     log.Println("Połączono z TimescaleDB")
-    //db.Ping() - faktycznie łączy się z bazą i sprawdza czy odpowiada. sql.Open() tego nie robi.
+
+    // --- AUTOMATYCZNE TWORZENIE TABELI (jeśli nie istnieje) ---
+    // Wykonujemy SQL który tworzy tabelę jeśli nie ma
+    // BACKTICKI ` zamiast cudzysłowów - pozwalają na wielolinijkowe stringi
+    _, err = db.Exec(`
+        CREATE TABLE IF NOT EXISTS sensor_readings (
+            time        TIMESTAMPTZ NOT NULL,
+            node_id     TEXT NOT NULL,
+            temperature DOUBLE PRECISION,
+            pm25        INTEGER,
+            accel_x     INTEGER,
+            accel_y     INTEGER,
+            accel_z     INTEGER,
+            alert_type  TEXT
+        )
+    `)
+    if err != nil {
+        log.Printf("Uwaga: nie można utworzyć tabeli: %v", err)
+    }
+
+    // --- AUTOMATYCZNE TWORZENIE HYPERTABELI (TimescaleDB) ---
+    // Sprawdzamy czy tabela jest już hypertabelą
+    var exists bool
+    err = db.QueryRow(`
+        SELECT EXISTS (
+            SELECT 1 FROM timescaledb_information.hypertables 
+            WHERE hypertable_name = 'sensor_readings'
+        )
+    `).Scan(&exists)
+    
+    // Jeśli to nie jest hypertabela, zamieniamy ją w hypertabelę
+    if err == nil && !exists {
+        // create_hypertable() to funkcja TimescaleDB
+        // if_not_exists => TRUE - nie rób nic jeśli już istnieje
+        _, err = db.Exec(`SELECT create_hypertable('sensor_readings', 'time', if_not_exists => TRUE)`)
+        if err != nil {
+            log.Printf("Uwaga: nie można utworzyć hypertabeli: %v", err)
+        } else {
+            log.Println("Utworzono hypertabelę sensor_readings")
+        }
+    }
 
     // --- POŁĄCZENIE Z MQTT ---
-    opts := mqtt.NewClientOptions() //Tworzy strukturę z opcjami (domyślne wartości) 
-    opts.AddBroker(MQTT_BROKER) //Dodaje adres brokera
-    opts.SetClientID(MQTT_CLIENTID) //Ustawia unikalne ID
-    opts.SetDefaultPublishHandler(messageHandler) //Ustawia callback na naszą funkcję!!!
+    // mqtt.NewClientOptions() - tworzy strukturę z opcjami (domyślne wartości)
+    opts := mqtt.NewClientOptions()
+    opts.AddBroker(mqttBroker)                    // Dodaje adres brokera
+    opts.SetClientID(mqttClientID)                // Ustawia unikalne ID klienta
+    opts.SetDefaultPublishHandler(messageHandler) // Ustawia callback na naszą funkcję!!!
+    opts.SetAutoReconnect(true)                   // Automatycznie łączy ponownie po przerwie
+    opts.SetConnectRetry(true)                    // Próbuje ponownie jeśli nie może się połączyć
+    opts.SetConnectTimeout(5 * time.Second)       // Timeout na połączenie
 
-    client := mqtt.NewClient(opts) //Tworzy klienta MQTT (nie łączy jeszcze)
-    if token := client.Connect(); token.Wait() && token.Error() != nil { //To jest IDIOMATYCZNE dla MQTT w Go:
+    // mqtt.NewClient() - tworzy klienta MQTT (nie łączy jeszcze, tylko tworzy obiekt)
+    client := mqtt.NewClient(opts)
+    
+    // To jest IDIOMATYCZNE dla MQTT w Go:
+    // token := client.Connect() - rozpoczyna łączenie, zwraca token (obiekt Future-like)
+    // token.Wait() - blokuje aż operacja się zakończy (jak wait na Future/Obietnicy)
+    // token.Error() - sprawdza czy był błąd
+    if token := client.Connect(); token.Wait() && token.Error() != nil {
         log.Fatal("Błąd MQTT:", token.Error())
     }
     log.Println("Połączono z MQTT brokerem")
-    //token := client.Connect()	Rozpoczyna łączenie, zwraca token
-    //token.Wait()	Blokuje aż operacja się zakończy (jak wait na Future)
-    //token.Error() != nil	Sprawdza czy był błąd
 
-    // --- SUBSTRYPCJA ---
-    //[]string - slice (dynamiczna tablica) stringów
-    //+ w topicu MQTT - wildcard (jeden poziom). sentinel/node/+/temperature pasuje do wszystkiego w miejscu plusa
+    // --- SUBSTRYPCJA TOPIKÓW ---
+    // []string - slice (dynamiczna tablica) stringów
+    // W MQTT: + (plus) to wildcard na JEDEN poziom
+    // sentinel/node/+/temperature pasuje do:
+    //   sentinel/node/01/temperature
+    //   sentinel/node/02/temperature
+    //   sentinel/node/ABC/temperature
+    // NIE pasuje do: sentinel/node/01/02/temperature (dwa poziomy)
     topics := []string{
         "sentinel/node/+/temperature",
         "sentinel/node/+/pm25",
@@ -197,11 +309,12 @@ func main() {
         "sentinel/alerts",
     }
 
-    for _, topic := range topics { //range topics	Iteruje przez slice, zwraca (indeks, wartość)
-        //_	Ignoruje indeks (więc mamy tylko wartość)
-        //dla każdego tematu subskrybuje
+    // range topics - iteruje przez slice, zwraca (indeks, wartość)
+    // _ - ignoruje indeks (pierwszy zwracany element), bierzemy tylko wartość
+    for _, topic := range topics {
+        // Subscribe(topic, QoS, callback) - QoS 1 = gwarancja dostarczenia
         token := client.Subscribe(topic, 1, nil)
-        token.Wait()
+        token.Wait() // Czekamy na potwierdzenie subskrypcji
         if token.Error() != nil {
             log.Printf("Błąd subskrypcji %s: %v", topic, token.Error())
         } else {
@@ -211,9 +324,14 @@ func main() {
 
     log.Println("Ingest service uruchomiony. Ctrl+C aby zakończyć.")
     
-    // Blokuj główny wątek (czekaj w nieskończoność)
-    select {} //Główny wątek nie może się zakończyć (bo wtedy program kończy działanie). Potrzebujemy czegoś co blokuje w nieskończoność.
+    // --- BLOKOWANIE GŁÓWNEGO WĄTKA ---
+    // Główny wątek nie może się zakończyć (bo wtedy program kończy działanie).
+    // Potrzebujemy czegoś co blokuje w nieskończoność.
+    // select {} - pusty select blokuje na zawsze (bo nie ma żadnego case'a do wykonania)
+    // To jak while(true) { sleep(INFINITY) } w innych językach
+    select {}
 }
+
 //1. Go ładuje pakiet main
 //2. Inicjalizuje zmienne globalne (db = nil)
 //3. Wywołuje func main()

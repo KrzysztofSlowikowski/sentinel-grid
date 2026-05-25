@@ -15,3 +15,5 @@ mpu6050_test
 Thumbs.db
 # Go
 services/ingest/ingest
+.env
+services/ingest/.env
