@@ -13,3 +13,5 @@ mpu6050_test
 # System
 .DS_Store
 Thumbs.db
+# Go
+services/ingest/ingest
