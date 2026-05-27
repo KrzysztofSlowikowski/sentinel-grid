@@ -4,7 +4,7 @@
 #include <MQTTClient.h>
 
 // Typ dla callbacku (funkcja którą wywołamy gdy przyjdzie wiadomość)
-typedef void (*mqtt_callback_t)(const char* topic, const char* payload);
+typedef int (*mqtt_callback_t)(void* context, char* topicName, int topicLen, MQTTClient_message* message);
 
 // Inicjalizacja i połączenie
 int mqtt_init(const char* broker, const char* client_id);

@@ -17,3 +17,9 @@ Thumbs.db
 services/ingest/ingest
 .env
 services/ingest/.env
+docker/mosquitto/data/
+docker/mosquitto/log/
+docker/timescaledb/data/
+services/ingest/ingest
+*.bak
+sentinel_gateway

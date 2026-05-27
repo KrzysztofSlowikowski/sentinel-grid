@@ -95,6 +95,7 @@ func saveAlert(nodeID string, alertType string, value interface{}, timestamp tim
 //To jest callback - funkcja wywoływana za każdym razem gdy przychodzi wiadomość MQTT.
 // Callback dla wiadomości MQTT
 func messageHandler(client mqtt.Client, msg mqtt.Message) {
+    log.Println(">>> messageHandler WYWOŁANY! <<<")
     //client mqtt.Client - Połączenie MQTT (możesz wysłać odpowiedź)
     //msg mqtt.Message - Odebrana wiadomość
     topic := msg.Topic() //Pobiera temat MQTT (np. "sentinel/node/01/temperature")
@@ -104,7 +105,20 @@ func messageHandler(client mqtt.Client, msg mqtt.Message) {
     log.Printf("Odebrano MQTT: %s -> %s", topic, payload)
 
     // Parsowanie topicu: sentinel/node/01/temperature
-    parts := strings.Split(topic, "/") //Dzieli string na tablicę po separatorze "/"
+    parts := strings.Split(topic, "/")
+
+    // Specjalna obsługa dla alertów (topic ma 2 części: sentinel/alerts)
+    if len(parts) == 2 && parts[0] == "sentinel" && parts[1] == "alerts" {
+        var alert AlertMessage
+        if err := json.Unmarshal([]byte(payload), &alert); err == nil {
+            saveAlert("all", alert.Type, alert.Value, timestamp)
+        } else {
+            log.Printf("Błąd parsowania alertu: %v", err)
+        }
+        return
+    }
+
+    // Normalne dane (4 części)
     if len(parts) < 4 {
         log.Printf("Nieznany format topicu: %s", topic)
         return
@@ -280,6 +294,8 @@ func main() {
     opts.SetDefaultPublishHandler(messageHandler) // Ustawia callback na naszą funkcję!!!
     opts.SetAutoReconnect(true)                   // Automatycznie łączy ponownie po przerwie
     opts.SetConnectRetry(true)                    // Próbuje ponownie jeśli nie może się połączyć
+    opts.SetCleanSession(false)  // ← DODAJ TO! Zachowuje subskrypcje
+    opts.SetResumeSubs(true) // ← DODAJ TO! Wznawia subskrypcje po reconnect
     opts.SetConnectTimeout(5 * time.Second)       // Timeout na połączenie
 
     // mqtt.NewClient() - tworzy klienta MQTT (nie łączy jeszcze, tylko tworzy obiekt)
@@ -311,15 +327,26 @@ func main() {
 
     // range topics - iteruje przez slice, zwraca (indeks, wartość)
     // _ - ignoruje indeks (pierwszy zwracany element), bierzemy tylko wartość
-    for _, topic := range topics {
-        // Subscribe(topic, QoS, callback) - QoS 1 = gwarancja dostarczenia
-        token := client.Subscribe(topic, 1, nil)
-        token.Wait() // Czekamy na potwierdzenie subskrypcji
-        if token.Error() != nil {
-            log.Printf("Błąd subskrypcji %s: %v", topic, token.Error())
-        } else {
-            log.Printf("Subskrybuję: %s", topic)
+    for i, topic := range topics {
+        log.Printf("Subskrybuję %d/%d: %s", i+1, len(topics), topic)
+        
+        t := topic
+        token := client.Subscribe(t, 1, func(c mqtt.Client, m mqtt.Message) {
+            messageHandler(c, m)
+        })
+        
+        if !token.WaitTimeout(5 * time.Second) {
+            log.Printf("Timeout subskrypcji: %s", t)
+            continue
         }
+        
+        if token.Error() != nil {
+            log.Printf("Błąd subskrypcji %s: %v", t, token.Error())
+        } else {
+            log.Printf("Subskrybuję: %s", t)
+        }
+        
+        time.Sleep(500 * time.Millisecond)  // ← DODAJ MAŁE OPOŹNIENIE
     }
 
     log.Println("Ingest service uruchomiony. Ctrl+C aby zakończyć.")
